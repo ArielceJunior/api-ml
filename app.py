@@ -10,9 +10,9 @@ from sklearn.ensemble import RandomForestClassifier
 from flask_cors import CORS # Importa o CORS
 
 # --- 1. Configuração do App e Banco de Dados ---
-app = Flask(_name_)
+app = Flask(__name__)
 # Define o caminho do banco de dados (assume que está na mesma pasta)
-db_path = os.path.join(os.path.abspath(os.path.dirname(_file_)), 'assinaturas.db')
+db_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'assinaturas.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 db = SQLAlchemy(app)
 
