@@ -206,7 +206,7 @@ def identificar_aparelho():
     )
 
 # --- 6. Inicialização ---
-if _name_ == '_main_':
+if __name__ == '__main__':
     with app.app_context():
         db.create_all() # Cria o arquivo 'assinaturas.db' se não existir
     # Roda o app na porta 5000, acessível por qualquer IP na rede
