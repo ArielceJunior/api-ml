@@ -16,6 +16,8 @@ db_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'assinaturas.
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 db = SQLAlchemy(app)
 
+with app.app_context():
+        db.create_all()
 
 origins = [
     "http://localhost:5173",                
@@ -207,7 +209,6 @@ def identificar_aparelho():
 
 # --- 6. Inicialização ---
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all() # Cria o arquivo 'assinaturas.db' se não existir
+     # Cria o arquivo 'assinaturas.db' se não existir
     # Roda o app na porta 5000, acessível por qualquer IP na rede
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

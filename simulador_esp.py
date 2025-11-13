@@ -3,7 +3,7 @@ import time
 import random
 
 # URL do seu servidor (se estiver rodando no mesmo PC)
-SERVER_URL = "http://127.0.0.1:5000/api/data_stream"
+SERVER_URL = "http://https://ariflaskml-dff5g9c7bdhyhsc5.brazilsouth-01.azurewebsites.net/api/data_stream"
 
 # Assinaturas "Falsas" que vamos simular
 ASSINATURAS = {
