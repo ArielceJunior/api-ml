@@ -16,8 +16,15 @@ db_path = os.path.join(os.path.abspath(os.path.dirname(_file_)), 'assinaturas.db
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 db = SQLAlchemy(app)
 
-# Habilita o CORS para permitir que o React (de outra porta) acesse a API
-CORS(app)
+
+origins = [
+    "http://localhost:5173",                
+    "http://localhost:3000",                 
+    "https://react-app-ml.vercel.app" 
+]
+
+# Configura o CORS para permitir apenas esses 'amigos'
+CORS(app, resources={r"/api/*": {"origins": origins}})
 
 # --- 2. Modelos do Banco de Dados ---
 class LeituraTempoReal(db.Model):
