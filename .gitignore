@@ -1,0 +1,20 @@
+# Arquivos do Python
+__pycache__/
+*.pyc
+.env
+venv/
+env/
+
+# Arquivos do OS
+.DS_Store
+Thumbs.db
+
+# Banco de dados
+# (Nós NÃO queremos que o GitHub guarde o banco,
+# ele será criado no servidor)
+*.db
+*.sqlite3
+
+# Arquivos sensíveis
+*.pem
+*.key
