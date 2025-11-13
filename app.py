@@ -54,7 +54,7 @@ def extrair_features(leituras_onda):
     return features
 
 # --- 4. Carregamento do Modelo de IA ---
-MODELO_IA_ARQUIVO = os.path.join(os.path.abspath(os.path.dirname(_file_)), 'modelo_aparelhos.pkl')
+MODELO_IA_ARQUIVO = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'modelo_aparelhos.pkl')
 modelo_ia = None
 if os.path.exists(MODELO_IA_ARQUIVO):
     try:
