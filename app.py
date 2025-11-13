@@ -10,9 +10,9 @@ from sklearn.ensemble import RandomForestClassifier
 from flask_cors import CORS # Importa o CORS
 
 # --- 1. Configuração do App e Banco de Dados ---
-app = Flask(__name__)
+app = Flask(_name_)
 # Define o caminho do banco de dados (assume que está na mesma pasta)
-db_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'assinaturas.db')
+db_path = os.path.join(os.path.abspath(os.path.dirname(_file_)), 'assinaturas.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 db = SQLAlchemy(app)
 
@@ -47,7 +47,7 @@ def extrair_features(leituras_onda):
     return features
 
 # --- 4. Carregamento do Modelo de IA ---
-MODELO_IA_ARQUIVO = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'modelo_aparelhos.pkl')
+MODELO_IA_ARQUIVO = os.path.join(os.path.abspath(os.path.dirname(_file_)), 'modelo_aparelhos.pkl')
 modelo_ia = None
 if os.path.exists(MODELO_IA_ARQUIVO):
     try:
@@ -63,13 +63,31 @@ else:
 # API 1: Recebe dados do ESP8266 (ou do simulador)
 @app.route('/api/data_stream', methods=['POST'])
 def data_stream():
-    data = request.get_json()
-    if 'potencia_w' in data:
-        nova_leitura = LeituraTempoReal(potencia_w=data['potencia_w'])
-        db.session.add(nova_leitura)
-        db.session.commit()
-        return jsonify(success=True)
-    return jsonify(success=False, error="Dados inválidos"), 400
+    data = request.get_json(silent=True) # Adicione silent=True para evitar 400s automáticos do Flask
+    
+    if data is None:
+        return jsonify(success=False, error="Conteúdo JSON mal formatado."), 400
+
+    # AGORA BUSCA A CHAVE CORRETA: 'power'
+    if 'power' in data:
+        try:
+            # Garante que o dado é um float antes de salvar
+            potencia_valor = float(data['power'])
+            
+            nova_leitura = LeituraTempoReal(potencia_w=potencia_valor)
+            db.session.add(nova_leitura)
+            db.session.commit()
+            
+            # Imprime no terminal para ver que está recebendo
+            print(f"Leitura recebida: {potencia_valor}W") 
+            
+            return jsonify(success=True)
+        
+        except ValueError:
+            return jsonify(success=False, error="Potência não é um número válido."), 400
+
+    # Se a chave 'power' não foi encontrada
+    return jsonify(success=False, error="Chave 'power' ausente no JSON."), 400
 
 # Função helper para a lógica de "escuta" inteligente
 def esperar_e_gravar(max_espera_s=300, gravacao_s=10, limiar_w=50.0):
@@ -181,7 +199,7 @@ def identificar_aparelho():
     )
 
 # --- 6. Inicialização ---
-if __name__ == '__main__':
+if _name_ == '_main_':
     with app.app_context():
         db.create_all() # Cria o arquivo 'assinaturas.db' se não existir
     # Roda o app na porta 5000, acessível por qualquer IP na rede
