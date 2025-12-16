@@ -26,9 +26,8 @@ db = SQLAlchemy(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- VARIÁVEIS GLOBAIS DE CONTROLE ---
-# Como estamos usando threads, precisamos de um dicionário para gerenciar o estado
 ESTADO_GRAVACAO = {
-    "status": "OCIOSO", # OCIOSO, AGUARDANDO_GATILHO, GRAVANDO, CONCLUIDO, ERRO
+    "status": "OCIOSO", 
     "mensagem": "Nenhuma gravação em andamento",
     "buffer": [],
     "ultima_leitura": 0.0,
@@ -55,55 +54,37 @@ with app.app_context():
     except Exception as e:
         logger.error(f"Erro DB: {e}")
 
-# --- FUNÇÃO WORKER (O CÉREBRO QUE RODA EM SEGUNDO PLANO) ---
+# --- FUNÇÃO WORKER (THREAD) ---
 def worker_gravacao(app_context, nome_aparelho):
-    """
-    Esta função roda separada do servidor principal.
-    Ela fica monitorando as variáveis globais sem travar a API.
-    """
     global ESTADO_GRAVACAO
-    
-    # Precisamos do contexto da aplicação para acessar o Banco de Dados dentro da Thread
     with app_context:
         logger.info(f"[THREAD] Iniciando monitoramento para: {nome_aparelho}")
-        
         start_wait = time.time()
         
-        # FASE 1: Esperar Gatilho (> 30W)
+        # FASE 1: Esperar Gatilho
         ESTADO_GRAVACAO['status'] = "AGUARDANDO_GATILHO"
-        ESTADO_GRAVACAO['buffer'] = [] # Limpa buffer
-        
-        gatilho_acionado = False
+        ESTADO_GRAVACAO['buffer'] = []
         
         while True:
-            # Timeout de espera (2 min)
             if (time.time() - start_wait) > 120:
                 ESTADO_GRAVACAO['status'] = "ERRO"
-                ESTADO_GRAVACAO['mensagem'] = "Timeout: Aparelho não ligou em 120s."
+                ESTADO_GRAVACAO['mensagem'] = "Timeout: Aparelho não ligou."
                 return
-
-            # Verifica a leitura atual (atualizada pela rota data_stream)
-            if ESTADO_GRAVACAO['ultima_leitura'] > 30.0:
-                gatilho_acionado = True
-                break
             
-            time.sleep(0.2) # Dorme pouco para não gastar CPU
+            if ESTADO_GRAVACAO['ultima_leitura'] > 30.0:
+                break
+            time.sleep(0.2)
 
         # FASE 2: Gravação
         logger.info("[THREAD] Gatilho acionado! Gravando...")
         ESTADO_GRAVACAO['status'] = "GRAVANDO"
         start_collect = time.time()
 
-        # O loop de coleta agora apenas espera o buffer encher
-        # Quem enche o buffer é a rota /data_stream
         while len(ESTADO_GRAVACAO['buffer']) < 10:
-            
-            # Timeout de coleta (se a internet cair)
             if (time.time() - start_collect) > 60:
                 ESTADO_GRAVACAO['status'] = "ERRO"
-                ESTADO_GRAVACAO['mensagem'] = "Timeout durante a coleta dos pontos."
+                ESTADO_GRAVACAO['mensagem'] = "Timeout coleta."
                 return
-            
             time.sleep(0.1)
 
         # FASE 3: Salvar
@@ -117,17 +98,12 @@ def worker_gravacao(app_context, nome_aparelho):
             db.session.commit()
             
             ESTADO_GRAVACAO['status'] = "CONCLUIDO"
-            ESTADO_GRAVACAO['mensagem'] = f"Sucesso! {len(valores_finais)} pontos gravados."
+            ESTADO_GRAVACAO['mensagem'] = f"Sucesso! {len(valores_finais)} pontos."
             logger.info("[THREAD] Gravação concluída com sucesso.")
-            
-            # Reset após alguns segundos (opcional, para limpar status)
-            # time.sleep(10)
-            # ESTADO_GRAVACAO['status'] = "OCIOSO"
             
         except Exception as e:
             ESTADO_GRAVACAO['status'] = "ERRO"
-            ESTADO_GRAVACAO['mensagem'] = f"Erro ao salvar no banco: {str(e)}"
-
+            ESTADO_GRAVACAO['mensagem'] = f"Erro ao salvar: {str(e)}"
 
 # --- ROTAS ---
 
@@ -135,68 +111,41 @@ def worker_gravacao(app_context, nome_aparelho):
 def home():
     return "API Async - Status: ONLINE", 200
 
-# 1. RECEBE DADOS (ALTA FREQUÊNCIA)
+# 1. RECEBE DADOS
 @app.route('/api/data_stream', methods=['POST'])
 def data_stream():
     global ESTADO_GRAVACAO
-    
     try:
         data = request.get_json()
         watts = float(data.get('watts', 0.0))
-        corrente = float(data.get('corrente', 0.0))
-        
-        # 1. Atualiza a "foto" atual para a Thread ver
         ESTADO_GRAVACAO['ultima_leitura'] = watts
 
-        # 2. Se a Thread estiver na fase GRAVANDO, guardamos o dado
         if ESTADO_GRAVACAO['status'] == "GRAVANDO":
-            # Evita buffer overflow se o ESP mandar muito rápido
             if len(ESTADO_GRAVACAO['buffer']) < 10:
                 ESTADO_GRAVACAO['buffer'].append(watts)
                 logger.info(f"Ponto capturado: {watts}W")
-
-        # (Opcional) Salvar histórico geral no banco
-        # Se estiver muito lento, comente as 3 linhas abaixo
-        # nova_leitura = LeituraTempoReal(corrente=corrente, watts=watts)
-        # db.session.add(nova_leitura)
-        # db.session.commit()
         
         return jsonify({"ack": True}), 200
-
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
-# 2. INICIAR GRAVAÇÃO (NÃO BLOQUEANTE)
+# 2. INICIAR GRAVAÇÃO
 @app.route('/api/gravar_assinatura', methods=['POST'])
 def gravar_assinatura():
     global ESTADO_GRAVACAO
-
-    # Se já estiver ocupado, rejeita
     if ESTADO_GRAVACAO['status'] in ["AGUARDANDO_GATILHO", "GRAVANDO"]:
-        return jsonify({"erro": "Já existe uma gravação em andamento."}), 409
+        return jsonify({"erro": "Ocupado"}), 409
 
     data = request.get_json()
     nome_aparelho = data.get('nome_aparelho', 'Desconhecido')
-
-    # Configura o estado inicial
     ESTADO_GRAVACAO['aparelho_alvo'] = nome_aparelho
-    ESTADO_GRAVACAO['mensagem'] = "Iniciando monitoramento..."
     
-    # --- A MÁGICA ACONTECE AQUI ---
-    # Criamos uma thread que roda a função worker_gravacao em paralelo
-    # Passamos o 'app' original para ele poder abrir conexão com o banco
     bg_thread = threading.Thread(target=worker_gravacao, args=(app.app_context(), nome_aparelho))
     bg_thread.start()
     
-    # Retorna IMEDIATAMENTE. Não espera o aparelho ligar.
-    return jsonify({
-        "mensagem": "Monitoramento iniciado. Ligue o aparelho agora.",
-        "status_url": "/api/status_gravacao" # O front deve consultar essa URL
-    }), 202
+    return jsonify({"mensagem": "Iniciado"}), 202
 
-# 3. CONSULTAR STATUS (POLLING)
-# Como a gravação é assíncrona, seu front/postman deve chamar essa rota
-# a cada 2 segundos para saber se acabou.
+# 3. CONSULTAR STATUS
 @app.route('/api/status_gravacao', methods=['GET'])
 def status_gravacao():
     return jsonify(ESTADO_GRAVACAO), 200
@@ -214,15 +163,13 @@ def listar_assinaturas():
         })
     return jsonify(lista), 200
 
-    # 4. IDENTIFICAR APARELHO (ROTINA DE COMPARAÇÃO)
-@app.route('/api/identificar', methods=['GET']) # Pode ser GET pois não precisa enviar dados, só ler o atual
+# 4. IDENTIFICAR APARELHO (AGORA ESTÁ NO LUGAR CERTO)
+@app.route('/api/identificar', methods=['GET'])
 def identificar():
     global ESTADO_GRAVACAO
     
-    # 1. Pega a leitura instantânea atual (que vem do /data_stream)
     leitura_atual = ESTADO_GRAVACAO.get('ultima_leitura', 0.0)
     
-    # Se estiver muito baixo, considera desligado (filtro de ruído)
     if leitura_atual < 5.0:
         return jsonify({
             "identificado": "Nenhum aparelho detectado",
@@ -231,40 +178,29 @@ def identificar():
         }), 200
 
     try:
-        # 2. Busca todos os aparelhos treinados no banco
         assinaturas = AssinaturaAparelho.query.all()
-        
         melhor_match = "Desconhecido"
-        menor_diferenca = float('inf') # Começa com infinito
+        menor_diferenca = float('inf')
         
-        # 3. Compara a leitura atual com a média de cada assinatura salva
         for assinatura in assinaturas:
             pontos = json.loads(assinatura.dados_json)
-            
-            # Calcula a média da assinatura (ex: média dos 10 pontos gravados)
             if len(pontos) > 0:
                 media_aparelho = sum(pontos) / len(pontos)
-                
-                # Diferença absoluta (módulo)
                 diferenca = abs(leitura_atual - media_aparelho)
                 
-                # Se essa diferença for a menor encontrada até agora, atualiza o campeão
                 if diferenca < menor_diferenca:
                     menor_diferenca = diferenca
                     melhor_match = assinatura.nome_aparelho
 
-        # 4. Define um Limite de Tolerância (Threshold)
-        # Se a diferença for maior que 50W (ou outro valor), diz que não sabe o que é.
         limite_tolerancia = 50.0 
         
         if menor_diferenca > limite_tolerancia:
             return jsonify({
                 "identificado": "Desconhecido / Não Cadastrado",
-                "detalhe": f"Parece {melhor_match}, mas a diferença é grande ({menor_diferenca:.1f}W)",
+                "detalhe": f"Parece {melhor_match}, mas dif={menor_diferenca:.1f}W",
                 "watts_atuais": leitura_atual
             }), 200
             
-        # 5. Retorna o sucesso
         return jsonify({
             "identificado": melhor_match,
             "diferenca": menor_diferenca,
