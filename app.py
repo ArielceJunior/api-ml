@@ -2,7 +2,8 @@ import os
 import time
 import json
 import logging
-from datetime import datetime, timedelta
+import threading  # <--- IMPORTANTE: Para rodar tarefas em background
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
@@ -24,13 +25,15 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# --- VARIÁVEIS GLOBAIS (ESTRATÉGIA DA FILA) ---
-# BUFFER_DADOS: A "caixa" onde guardamos os dados durante a gravação
-BUFFER_DADOS = []       
-# GRAVANDO_AGORA: A "chave" que diz se devemos guardar os dados ou jogar fora
-GRAVANDO_AGORA = False  
-# ULTIMA_LEITURA: Usado apenas para o gatilho (saber se ligou)
-ULTIMA_LEITURA = 0.0    
+# --- VARIÁVEIS GLOBAIS DE CONTROLE ---
+# Como estamos usando threads, precisamos de um dicionário para gerenciar o estado
+ESTADO_GRAVACAO = {
+    "status": "OCIOSO", # OCIOSO, AGUARDANDO_GATILHO, GRAVANDO, CONCLUIDO, ERRO
+    "mensagem": "Nenhuma gravação em andamento",
+    "buffer": [],
+    "ultima_leitura": 0.0,
+    "aparelho_alvo": ""
+}
 
 # --- MODELOS DO BANCO ---
 class LeituraTempoReal(db.Model):
@@ -49,137 +52,154 @@ class AssinaturaAparelho(db.Model):
 with app.app_context():
     try:
         db.create_all()
-        logger.info(f"Banco de dados inicializado em: {db_path}")
     except Exception as e:
-        logger.error(f"Erro ao criar tabelas: {e}")
+        logger.error(f"Erro DB: {e}")
+
+# --- FUNÇÃO WORKER (O CÉREBRO QUE RODA EM SEGUNDO PLANO) ---
+def worker_gravacao(app_context, nome_aparelho):
+    """
+    Esta função roda separada do servidor principal.
+    Ela fica monitorando as variáveis globais sem travar a API.
+    """
+    global ESTADO_GRAVACAO
+    
+    # Precisamos do contexto da aplicação para acessar o Banco de Dados dentro da Thread
+    with app_context:
+        logger.info(f"[THREAD] Iniciando monitoramento para: {nome_aparelho}")
+        
+        start_wait = time.time()
+        
+        # FASE 1: Esperar Gatilho (> 30W)
+        ESTADO_GRAVACAO['status'] = "AGUARDANDO_GATILHO"
+        ESTADO_GRAVACAO['buffer'] = [] # Limpa buffer
+        
+        gatilho_acionado = False
+        
+        while True:
+            # Timeout de espera (2 min)
+            if (time.time() - start_wait) > 120:
+                ESTADO_GRAVACAO['status'] = "ERRO"
+                ESTADO_GRAVACAO['mensagem'] = "Timeout: Aparelho não ligou em 120s."
+                return
+
+            # Verifica a leitura atual (atualizada pela rota data_stream)
+            if ESTADO_GRAVACAO['ultima_leitura'] > 30.0:
+                gatilho_acionado = True
+                break
+            
+            time.sleep(0.2) # Dorme pouco para não gastar CPU
+
+        # FASE 2: Gravação
+        logger.info("[THREAD] Gatilho acionado! Gravando...")
+        ESTADO_GRAVACAO['status'] = "GRAVANDO"
+        start_collect = time.time()
+
+        # O loop de coleta agora apenas espera o buffer encher
+        # Quem enche o buffer é a rota /data_stream
+        while len(ESTADO_GRAVACAO['buffer']) < 10:
+            
+            # Timeout de coleta (se a internet cair)
+            if (time.time() - start_collect) > 60:
+                ESTADO_GRAVACAO['status'] = "ERRO"
+                ESTADO_GRAVACAO['mensagem'] = "Timeout durante a coleta dos pontos."
+                return
+            
+            time.sleep(0.1)
+
+        # FASE 3: Salvar
+        try:
+            valores_finais = list(ESTADO_GRAVACAO['buffer'])
+            nova_assinatura = AssinaturaAparelho(
+                nome_aparelho=nome_aparelho,
+                dados_json=json.dumps(valores_finais)
+            )
+            db.session.add(nova_assinatura)
+            db.session.commit()
+            
+            ESTADO_GRAVACAO['status'] = "CONCLUIDO"
+            ESTADO_GRAVACAO['mensagem'] = f"Sucesso! {len(valores_finais)} pontos gravados."
+            logger.info("[THREAD] Gravação concluída com sucesso.")
+            
+            # Reset após alguns segundos (opcional, para limpar status)
+            # time.sleep(10)
+            # ESTADO_GRAVACAO['status'] = "OCIOSO"
+            
+        except Exception as e:
+            ESTADO_GRAVACAO['status'] = "ERRO"
+            ESTADO_GRAVACAO['mensagem'] = f"Erro ao salvar no banco: {str(e)}"
+
 
 # --- ROTAS ---
 
 @app.route('/')
 def home():
-    return "API de Reconhecimento de Energia - Status: ONLINE (Modo Buffer 10 Pontos)", 200
+    return "API Async - Status: ONLINE", 200
 
-@app.route('/api/setup_db', methods=['GET'])
-def setup_db():
-    try:
-        with app.app_context():
-            db.create_all()
-        return jsonify({"message": "Tabelas recriadas com sucesso."}), 200
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
-
-# 1. RECEBE DADOS DO ESP32
+# 1. RECEBE DADOS (ALTA FREQUÊNCIA)
 @app.route('/api/data_stream', methods=['POST'])
 def data_stream():
-    global ULTIMA_LEITURA, BUFFER_DADOS, GRAVANDO_AGORA
+    global ESTADO_GRAVACAO
     
     try:
         data = request.get_json()
-        
-        # Pega os dados (padrão 0.0 se falhar)
-        watts = float(data.get('watts', data.get('power', 0.0)))
+        watts = float(data.get('watts', 0.0))
         corrente = float(data.get('corrente', 0.0))
         
-        # 1. Atualiza a leitura instantânea (para o gatilho ver)
-        ULTIMA_LEITURA = watts
-        logger.info(f"Recebido: {watts}W")
+        # 1. Atualiza a "foto" atual para a Thread ver
+        ESTADO_GRAVACAO['ultima_leitura'] = watts
 
-        # 2. ESTRATÉGIA DO BUFFER: 
-        # Se a gravação estiver ativa, joga esse dado na caixa!
-        if GRAVANDO_AGORA:
-            BUFFER_DADOS.append(watts)
-            logger.info(f"--> [GRAVANDO] Ponto capturado: {len(BUFFER_DADOS)}/10")
+        # 2. Se a Thread estiver na fase GRAVANDO, guardamos o dado
+        if ESTADO_GRAVACAO['status'] == "GRAVANDO":
+            # Evita buffer overflow se o ESP mandar muito rápido
+            if len(ESTADO_GRAVACAO['buffer']) < 10:
+                ESTADO_GRAVACAO['buffer'].append(watts)
+                logger.info(f"Ponto capturado: {watts}W")
 
-        # 3. Salva no Banco (Histórico opcional, mantive seu código original)
-        nova_leitura = LeituraTempoReal(corrente=corrente, watts=watts)
-        db.session.add(nova_leitura)
-        db.session.commit()
+        # (Opcional) Salvar histórico geral no banco
+        # Se estiver muito lento, comente as 3 linhas abaixo
+        # nova_leitura = LeituraTempoReal(corrente=corrente, watts=watts)
+        # db.session.add(nova_leitura)
+        # db.session.commit()
         
-        return jsonify({"status": "recebido", "watts": watts}), 200
+        return jsonify({"ack": True}), 200
 
     except Exception as e:
-        logger.error(f"Erro no data_stream: {e}")
         return jsonify({"erro": str(e)}), 500
 
-# 2. GRAVAR ASSINATURA (CORRIGIDO: SISTEMA DE FILA/BUFFER)
+# 2. INICIAR GRAVAÇÃO (NÃO BLOQUEANTE)
 @app.route('/api/gravar_assinatura', methods=['POST'])
 def gravar_assinatura():
-    global ULTIMA_LEITURA, BUFFER_DADOS, GRAVANDO_AGORA
+    global ESTADO_GRAVACAO
+
+    # Se já estiver ocupado, rejeita
+    if ESTADO_GRAVACAO['status'] in ["AGUARDANDO_GATILHO", "GRAVANDO"]:
+        return jsonify({"erro": "Já existe uma gravação em andamento."}), 409
+
+    data = request.get_json()
+    nome_aparelho = data.get('nome_aparelho', 'Desconhecido')
+
+    # Configura o estado inicial
+    ESTADO_GRAVACAO['aparelho_alvo'] = nome_aparelho
+    ESTADO_GRAVACAO['mensagem'] = "Iniciando monitoramento..."
     
-    try:
-        dados_req = request.get_json()
-        nome_aparelho = dados_req.get('nome_aparelho', 'Desconhecido')
-        
-        logger.info(f"--- INICIANDO GRAVAÇÃO PARA: {nome_aparelho} ---")
+    # --- A MÁGICA ACONTECE AQUI ---
+    # Criamos uma thread que roda a função worker_gravacao em paralelo
+    # Passamos o 'app' original para ele poder abrir conexão com o banco
+    bg_thread = threading.Thread(target=worker_gravacao, args=(app.app_context(), nome_aparelho))
+    bg_thread.start()
+    
+    # Retorna IMEDIATAMENTE. Não espera o aparelho ligar.
+    return jsonify({
+        "mensagem": "Monitoramento iniciado. Ligue o aparelho agora.",
+        "status_url": "/api/status_gravacao" # O front deve consultar essa URL
+    }), 202
 
-        # 1. RESET: Limpa a caixa e trava a gravação
-        GRAVANDO_AGORA = False
-        BUFFER_DADOS = []
-
-        # 2. GATILHO: Espera o aparelho ligar (> 30W)
-        logger.info("Aguardando sinal acima de 30W...")
-        start_wait = time.time()
-        
-        while True:
-            # Timeout de segurança (2 minutos esperando ligar)
-            if (time.time() - start_wait) > 120: 
-                return jsonify({"erro": "Tempo limite excedido. O aparelho não foi ligado."}), 400
-            
-            # Verifica o gatilho na variável atualizada pelo data_stream
-            if ULTIMA_LEITURA > 30.0:
-                logger.info(f"GATILHO DETECTADO: {ULTIMA_LEITURA}W")
-                break
-                
-            time.sleep(0.5) # Checa a cada meio segundo
-
-        # 3. GRAVAÇÃO: Abre a comporta e espera encher 10 pontos
-        logger.info("GATILHO ACIONADO! COLETANDO 10 PONTOS...")
-        GRAVANDO_AGORA = True # <--- AQUI O ESP32 COMEÇA A ENCHER A LISTA
-        
-        start_collect = time.time()
-        
-        # Fica preso aqui até ter 10 pontos na lista
-        while len(BUFFER_DADOS) < 10:
-            
-            # Timeout de segurança (se a internet cair no meio e parar de chegar dados)
-            if (time.time() - start_collect) > 60: 
-                GRAVANDO_AGORA = False
-                return jsonify({
-                    "erro": f"Falha na coleta. Consegui apenas {len(BUFFER_DADOS)} pontos.",
-                    "dados_parciais": BUFFER_DADOS
-                }), 400
-            
-            time.sleep(0.5) # Dorme um pouquinho enquanto a lista enche
-
-        # 4. FINALIZAÇÃO
-        GRAVANDO_AGORA = False # Fecha a comporta
-        
-        # Faz uma cópia dos dados para salvar
-        valores_capturados = list(BUFFER_DADOS)
-        logger.info(f"COLETA CONCLUÍDA! Dados: {valores_capturados}")
-
-        # Salva a assinatura definitiva no Banco
-        nova_assinatura = AssinaturaAparelho(
-            nome_aparelho=nome_aparelho,
-            dados_json=json.dumps(valores_capturados)
-        )
-        db.session.add(nova_assinatura)
-        db.session.commit()
-
-        # Limpa o buffer para a próxima vez
-        BUFFER_DADOS = []
-
-        return jsonify({
-            "mensagem": f"Sucesso! Assinatura de '{nome_aparelho}' salva.",
-            "pontos_capturados": len(valores_capturados),
-            "dados": valores_capturados
-        }), 200
-
-    except Exception as e:
-        # Garante que destrava em caso de erro
-        GRAVANDO_AGORA = False 
-        logger.error(f"Erro fatal ao gravar: {e}")
-        return jsonify({"erro": str(e)}), 500
+# 3. CONSULTAR STATUS (POLLING)
+# Como a gravação é assíncrona, seu front/postman deve chamar essa rota
+# a cada 2 segundos para saber se acabou.
+@app.route('/api/status_gravacao', methods=['GET'])
+def status_gravacao():
+    return jsonify(ESTADO_GRAVACAO), 200
 
 @app.route('/api/listar_assinaturas', methods=['GET'])
 def listar_assinaturas():
@@ -189,6 +209,7 @@ def listar_assinaturas():
         lista.append({
             "id": a.id,
             "nome": a.nome_aparelho,
+            "pontos": json.loads(a.dados_json),
             "data": a.data_criacao
         })
     return jsonify(lista), 200
