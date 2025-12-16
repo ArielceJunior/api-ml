@@ -69,6 +69,16 @@ else:
 
 # --- 5. APIs (Endpoints) ---
 
+@app.route('/api/setup_db', methods=['GET'])
+def setup_db():
+    try:
+        # Força a criação das tabelas AGORA
+        with app.app_context():
+            db.create_all()
+        return jsonify({"message": "SUCESSO! Tabelas criadas no banco de dados."}), 200
+    except Exception as e:
+        return jsonify({"erro": f"Falha ao criar tabelas: {str(e)}"}), 500
+
 # API 1: Recebe dados do ESP8266 (ou do simulador)
 @app.route('/api/data_stream', methods=['POST'])
 def data_stream():
