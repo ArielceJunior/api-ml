@@ -2,7 +2,7 @@ import os
 import time
 import json
 import logging
-import threading  # <--- IMPORTANTE: Para rodar tarefas em background
+import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -26,6 +26,8 @@ db = SQLAlchemy(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- VARIÁVEIS GLOBAIS DE CONTROLE ---
+
+# Controle da Gravação Assíncrona
 ESTADO_GRAVACAO = {
     "status": "OCIOSO", 
     "mensagem": "Nenhuma gravação em andamento",
@@ -33,6 +35,12 @@ ESTADO_GRAVACAO = {
     "ultima_leitura": 0.0,
     "aparelho_alvo": ""
 }
+
+# Controle da Identificação (Janela Deslizante)
+BUFFER_IDENTIFICACAO = []   # Guarda os últimos 5 valores
+TAMANHO_JANELA = 5          # Quantidade de pontos para fazer a média
+APARELHO_ATUAL = "Desconhecido" # O veredito do sistema no momento
+ULTIMA_MEDIA = 0.0          # Média calculada da janela
 
 # --- MODELOS DO BANCO ---
 class LeituraTempoReal(db.Model):
@@ -54,7 +62,54 @@ with app.app_context():
     except Exception as e:
         logger.error(f"Erro DB: {e}")
 
-# --- FUNÇÃO WORKER (THREAD) ---
+
+# --- LÓGICA DE INTELIGÊNCIA (IDENTIFICAÇÃO) ---
+def processar_identificacao(media_atual):
+    """
+    Compara a média atual (dos ultimos 5 segundos) com as assinaturas do banco.
+    """
+    global APARELHO_ATUAL
+    
+    # 1. Se for muito baixo, nem perde tempo procurando no banco
+    if media_atual < 10.0:
+        APARELHO_ATUAL = "Desligado / Standby"
+        return
+
+    try:
+        # Pega todas as assinaturas salvas
+        assinaturas = AssinaturaAparelho.query.all()
+        
+        melhor_match = "Desconhecido"
+        menor_diferenca = float('inf')
+        
+        for assinatura in assinaturas:
+            # Recupera os dados salvos
+            pontos_salvos = json.loads(assinatura.dados_json)
+            if not pontos_salvos: continue
+            
+            # Média da assinatura salva
+            media_salva = sum(pontos_salvos) / len(pontos_salvos)
+            
+            # Compara com a média atual
+            diferenca = abs(media_atual - media_salva)
+            
+            # Lógica: O quão perto precisa estar? (Ex: +/- 25W)
+            if diferenca < 25.0 and diferenca < menor_diferenca:
+                menor_diferenca = diferenca
+                melhor_match = assinatura.nome_aparelho
+        
+        # Atualiza o veredito global
+        if melhor_match != "Desconhecido":
+            APARELHO_ATUAL = melhor_match
+            # logger.info(f"Identificado: {melhor_match} (Diff: {menor_diferenca:.1f})")
+        else:
+            APARELHO_ATUAL = "Desconhecido"
+
+    except Exception as e:
+        logger.error(f"Erro ao identificar: {e}")
+
+
+# --- FUNÇÃO WORKER (THREAD - GRAVAÇÃO) ---
 def worker_gravacao(app_context, nome_aparelho):
     global ESTADO_GRAVACAO
     with app_context:
@@ -71,6 +126,7 @@ def worker_gravacao(app_context, nome_aparelho):
                 ESTADO_GRAVACAO['mensagem'] = "Timeout: Aparelho não ligou."
                 return
             
+            # Gatilho: espera subir acima de 30W
             if ESTADO_GRAVACAO['ultima_leitura'] > 30.0:
                 break
             time.sleep(0.2)
@@ -80,6 +136,7 @@ def worker_gravacao(app_context, nome_aparelho):
         ESTADO_GRAVACAO['status'] = "GRAVANDO"
         start_collect = time.time()
 
+        # Espera o buffer encher (quem enche é o data_stream)
         while len(ESTADO_GRAVACAO['buffer']) < 10:
             if (time.time() - start_collect) > 60:
                 ESTADO_GRAVACAO['status'] = "ERRO"
@@ -109,23 +166,41 @@ def worker_gravacao(app_context, nome_aparelho):
 
 @app.route('/')
 def home():
-    return "API Async - Status: ONLINE", 200
+    return "API Inteligente - Status: ONLINE", 200
 
-# 1. RECEBE DADOS
+# 1. RECEBE DADOS (ESP32 -> API)
 @app.route('/api/data_stream', methods=['POST'])
 def data_stream():
-    global ESTADO_GRAVACAO
+    global ESTADO_GRAVACAO, BUFFER_IDENTIFICACAO, ULTIMA_MEDIA
+    
     try:
         data = request.get_json()
         watts = float(data.get('watts', 0.0))
+        
+        # Atualiza variável rápida para a Thread de Gravação ler
         ESTADO_GRAVACAO['ultima_leitura'] = watts
 
+        # --- LÓGICA 1: ALIMENTAR GRAVAÇÃO (SE HOUVER) ---
         if ESTADO_GRAVACAO['status'] == "GRAVANDO":
             if len(ESTADO_GRAVACAO['buffer']) < 10:
                 ESTADO_GRAVACAO['buffer'].append(watts)
-                logger.info(f"Ponto capturado: {watts}W")
+                logger.info(f"Ponto de Gravação: {watts}W")
+
+        # --- LÓGICA 2: ALIMENTAR IDENTIFICAÇÃO (JANELA DESLIZANTE) ---
+        BUFFER_IDENTIFICACAO.append(watts)
         
+        # Mantém a janela apenas com 5 itens (FIFO)
+        if len(BUFFER_IDENTIFICACAO) > TAMANHO_JANELA:
+            BUFFER_IDENTIFICACAO.pop(0)
+
+        # Se a janela está cheia, calcula média e tenta identificar
+        if len(BUFFER_IDENTIFICACAO) == TAMANHO_JANELA:
+            media = sum(BUFFER_IDENTIFICACAO) / TAMANHO_JANELA
+            ULTIMA_MEDIA = media # Guarda para o front ver
+            processar_identificacao(media)
+
         return jsonify({"ack": True}), 200
+
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
@@ -145,11 +220,23 @@ def gravar_assinatura():
     
     return jsonify({"mensagem": "Iniciado"}), 202
 
-# 3. CONSULTAR STATUS
+# 3. CONSULTAR STATUS DA GRAVAÇÃO
 @app.route('/api/status_gravacao', methods=['GET'])
 def status_gravacao():
     return jsonify(ESTADO_GRAVACAO), 200
 
+# 4. CONSULTAR STATUS EM TEMPO REAL (IDENTIFICAÇÃO)
+# O Frontend deve chamar essa rota a cada 1s ou 2s
+@app.route('/api/status_atual', methods=['GET'])
+def status_atual():
+    global APARELHO_ATUAL, ESTADO_GRAVACAO, ULTIMA_MEDIA
+    return jsonify({
+        "watts_instantaneo": ESTADO_GRAVACAO['ultima_leitura'],
+        "watts_media_janela": ULTIMA_MEDIA,
+        "aparelho_identificado": APARELHO_ATUAL
+    }), 200
+
+# 5. LISTAR ASSINATURAS SALVAS
 @app.route('/api/listar_assinaturas', methods=['GET'])
 def listar_assinaturas():
     assinaturas = AssinaturaAparelho.query.all()
@@ -162,54 +249,6 @@ def listar_assinaturas():
             "data": a.data_criacao
         })
     return jsonify(lista), 200
-
-# 4. IDENTIFICAR APARELHO (AGORA ESTÁ NO LUGAR CERTO)
-@app.route('/api/identificar', methods=['GET'])
-def identificar():
-    global ESTADO_GRAVACAO
-    
-    leitura_atual = ESTADO_GRAVACAO.get('ultima_leitura', 0.0)
-    
-    if leitura_atual < 5.0:
-        return jsonify({
-            "identificado": "Nenhum aparelho detectado",
-            "confianca": "Alta",
-            "watts_atuais": leitura_atual
-        }), 200
-
-    try:
-        assinaturas = AssinaturaAparelho.query.all()
-        melhor_match = "Desconhecido"
-        menor_diferenca = float('inf')
-        
-        for assinatura in assinaturas:
-            pontos = json.loads(assinatura.dados_json)
-            if len(pontos) > 0:
-                media_aparelho = sum(pontos) / len(pontos)
-                diferenca = abs(leitura_atual - media_aparelho)
-                
-                if diferenca < menor_diferenca:
-                    menor_diferenca = diferenca
-                    melhor_match = assinatura.nome_aparelho
-
-        limite_tolerancia = 50.0 
-        
-        if menor_diferenca > limite_tolerancia:
-            return jsonify({
-                "identificado": "Desconhecido / Não Cadastrado",
-                "detalhe": f"Parece {melhor_match}, mas dif={menor_diferenca:.1f}W",
-                "watts_atuais": leitura_atual
-            }), 200
-            
-        return jsonify({
-            "identificado": melhor_match,
-            "diferenca": menor_diferenca,
-            "watts_atuais": leitura_atual
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Erro na identificação: {e}")
-        return jsonify({"erro": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
