@@ -214,6 +214,67 @@ def listar_assinaturas():
         })
     return jsonify(lista), 200
 
+    # 4. IDENTIFICAR APARELHO (ROTINA DE COMPARAÇÃO)
+@app.route('/api/identificar', methods=['GET']) # Pode ser GET pois não precisa enviar dados, só ler o atual
+def identificar():
+    global ESTADO_GRAVACAO
+    
+    # 1. Pega a leitura instantânea atual (que vem do /data_stream)
+    leitura_atual = ESTADO_GRAVACAO.get('ultima_leitura', 0.0)
+    
+    # Se estiver muito baixo, considera desligado (filtro de ruído)
+    if leitura_atual < 5.0:
+        return jsonify({
+            "identificado": "Nenhum aparelho detectado",
+            "confianca": "Alta",
+            "watts_atuais": leitura_atual
+        }), 200
+
+    try:
+        # 2. Busca todos os aparelhos treinados no banco
+        assinaturas = AssinaturaAparelho.query.all()
+        
+        melhor_match = "Desconhecido"
+        menor_diferenca = float('inf') # Começa com infinito
+        
+        # 3. Compara a leitura atual com a média de cada assinatura salva
+        for assinatura in assinaturas:
+            pontos = json.loads(assinatura.dados_json)
+            
+            # Calcula a média da assinatura (ex: média dos 10 pontos gravados)
+            if len(pontos) > 0:
+                media_aparelho = sum(pontos) / len(pontos)
+                
+                # Diferença absoluta (módulo)
+                diferenca = abs(leitura_atual - media_aparelho)
+                
+                # Se essa diferença for a menor encontrada até agora, atualiza o campeão
+                if diferenca < menor_diferenca:
+                    menor_diferenca = diferenca
+                    melhor_match = assinatura.nome_aparelho
+
+        # 4. Define um Limite de Tolerância (Threshold)
+        # Se a diferença for maior que 50W (ou outro valor), diz que não sabe o que é.
+        limite_tolerancia = 50.0 
+        
+        if menor_diferenca > limite_tolerancia:
+            return jsonify({
+                "identificado": "Desconhecido / Não Cadastrado",
+                "detalhe": f"Parece {melhor_match}, mas a diferença é grande ({menor_diferenca:.1f}W)",
+                "watts_atuais": leitura_atual
+            }), 200
+            
+        # 5. Retorna o sucesso
+        return jsonify({
+            "identificado": melhor_match,
+            "diferenca": menor_diferenca,
+            "watts_atuais": leitura_atual
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Erro na identificação: {e}")
+        return jsonify({"erro": str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
