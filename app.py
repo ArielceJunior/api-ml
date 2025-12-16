@@ -140,7 +140,7 @@ def gravar_assinatura():
         hora_gatilho = datetime.now()
         
         # Espera 5 segundos para o ESP32 enviar dados suficientes
-        time.sleep(6) 
+        time.sleep(16) # 16 segundos para garantir 15 amostras (1 por segundo)
         
         # Busca no banco tudo que chegou DEPOIS do gatilho
         leituras = LeituraTempoReal.query.filter(
