@@ -25,10 +25,11 @@ db = SQLAlchemy(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- VARIÁVEIS GLOBAIS (CACHE RAM) ---
-# Aqui fica a última leitura recebida, acessível instantaneamente
+# Aqui fica a última leitura recebida e QUANDO ela foi recebida
 ULTIMA_LEITURA_CACHE = {
     "watts": 0.0,
-    "timestamp": 0
+    "corrente": 0.0,
+    "timestamp": 0.0
 }
 
 # --- MODELOS DO BANCO ---
@@ -56,7 +57,7 @@ with app.app_context():
 
 @app.route('/')
 def home():
-    return "API de Reconhecimento de Energia - Status: ONLINE (Modo RAM Ativado)", 200
+    return "API de Reconhecimento de Energia - Status: ONLINE (Modo Alta Precisão)", 200
 
 @app.route('/api/setup_db', methods=['GET'])
 def setup_db():
@@ -75,16 +76,18 @@ def data_stream():
         data = request.get_json()
         
         # Pega os dados (padrão 0.0 se falhar)
-        watts = float(data.get('watts', 0.0))
+        # Tenta pegar 'watts' ou 'power' para compatibilidade
+        watts = float(data.get('watts', data.get('power', 0.0)))
         corrente = float(data.get('corrente', 0.0))
         
-        # 1. Atualiza a Memória RAM (Instantâneo)
+        # 1. Atualiza a Memória RAM com TIMESTAMP
         ULTIMA_LEITURA_CACHE['watts'] = watts
-        ULTIMA_LEITURA_CACHE['timestamp'] = time.time()
+        ULTIMA_LEITURA_CACHE['corrente'] = corrente
+        ULTIMA_LEITURA_CACHE['timestamp'] = time.time() # Marca a hora exata que chegou
         
         logger.info(f"Recebido: {watts}W")
 
-        # 2. Salva no Banco (Histórico opcional, pode ser removido se quiser mais performance)
+        # 2. Salva no Banco (Histórico)
         nova_leitura = LeituraTempoReal(corrente=corrente, watts=watts)
         db.session.add(nova_leitura)
         db.session.commit()
@@ -95,7 +98,7 @@ def data_stream():
         logger.error(f"Erro no data_stream: {e}")
         return jsonify({"erro": str(e)}), 500
 
-# 2. GRAVAR ASSINATURA (CORRIGIDO PARA LER DA RAM)
+# 2. GRAVAR ASSINATURA (CORRIGIDO: SEM REPETIÇÃO)
 @app.route('/api/gravar_assinatura', methods=['POST'])
 def gravar_assinatura():
     global ULTIMA_LEITURA_CACHE
@@ -110,50 +113,60 @@ def gravar_assinatura():
         start_wait = time.time()
         sinal_detectado = False
         
+        logger.info("Aguardando sinal acima de 30W...")
+        
         while (time.time() - start_wait) < 300: # 5 min timeout
-            # Lê da RAM
-            potencia_atual = ULTIMA_LEITURA_CACHE['watts']
             
-            # Verifica se o dado é recente (menos de 5 seg)
-            dado_recente = (time.time() - ULTIMA_LEITURA_CACHE['timestamp']) < 5
+            potencia_atual = ULTIMA_LEITURA_CACHE['watts']
+            tempo_dado = ULTIMA_LEITURA_CACHE['timestamp']
+            
+            # Verifica se o dado é recente (menos de 5 seg) para não disparar com dado velho
+            dado_recente = (time.time() - tempo_dado) < 5
 
             if dado_recente and potencia_atual > 30.0:
                 logger.info(f"GATILHO! {potencia_atual}W. Gravando...")
                 sinal_detectado = True
                 break
             
-            time.sleep(0.5)
+            time.sleep(0.2) # Checagem rápida do gatilho
 
         if not sinal_detectado:
             return jsonify({"erro": "Tempo limite excedido. Aparelho não ligado."}), 400
 
-        # --- FASE 2: GRAVAÇÃO DA CURVA (A CORREÇÃO ESTÁ AQUI) ---
-        # Em vez de esperar 16s e ler do banco, lemos da RAM em tempo real
+        # --- FASE 2: GRAVAÇÃO DA CURVA (SEM REPETIDOS) ---
         
         valores_lidos = []
         inicio_gravacao = time.time()
+        ultimo_timestamp_capturado = 0.0 # Controle para não repetir
         
-        logger.info("Capturando dados da RAM...")
+        logger.info("Capturando dados da RAM (Sem repetições)...")
 
         # Grava por 5 segundos
         while (time.time() - inicio_gravacao) < 5:
-            # Pega o valor atual da RAM
-            valor_atual = ULTIMA_LEITURA_CACHE['watts']
-            valores_lidos.append(valor_atual)
             
-            # Espera 0.5s para pegar o próximo ponto (ESP manda a cada 1s aprox)
-            time.sleep(0.5)
+            pacote_atual = ULTIMA_LEITURA_CACHE
             
-        logger.info(f"Gravação concluída. Pontos: {len(valores_lidos)}")
+            # Só adiciona se o timestamp for diferente do último capturado
+            if pacote_atual['timestamp'] != ultimo_timestamp_capturado:
+                
+                valores_lidos.append(pacote_atual['watts'])
+                ultimo_timestamp_capturado = pacote_atual['timestamp'] # Atualiza o controle
+                
+                # logger.info(f"Capturado ponto único: {pacote_atual['watts']}W") 
+            
+            # Gira MUITO rápido para pegar o dado assim que o ESP mandar
+            time.sleep(0.05) 
+            
+        logger.info(f"Gravação concluída. Pontos ÚNICOS: {len(valores_lidos)}")
 
         # Verifica se capturou algo
         if not valores_lidos:
-             return jsonify({"erro": "Nenhum dado recebido durante a gravação."}), 500
+             return jsonify({"erro": "Nenhum dado novo recebido durante a gravação."}), 500
 
         # Salva a assinatura definitiva no Banco
         nova_assinatura = AssinaturaAparelho(
             nome_aparelho=nome_aparelho,
-            dados_json=json.dumps(valores_lidos) # Salva o array direto
+            dados_json=json.dumps(valores_lidos)
         )
         db.session.add(nova_assinatura)
         db.session.commit()
